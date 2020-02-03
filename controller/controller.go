@@ -27,10 +27,12 @@ import (
 
 	"k8s.isazi.ai/descaler/event"
 	"k8s.isazi.ai/descaler/handlers"
+	"k8s.isazi.ai/descaler/metrics"
 	"k8s.isazi.ai/descaler/utils"
 
 	autoscaling_v2beta1 "k8s.io/api/autoscaling/v2beta1"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -278,113 +280,124 @@ func (c *Controller) processItem(newEvent Event) error {
 
 func hpaUpdated(clientSet *kubernetes.Clientset, autoscaler *autoscaling_v2beta1.HorizontalPodAutoscaler) error {
 	replicas := autoscaler.Status.CurrentReplicas
-	desired := autoscaler.Status.DesiredReplicas
 	// targetKind := autoscaler.Spec.ScaleTargetRef.Kind
 	target := autoscaler.Spec.ScaleTargetRef.Name
 
-	if len(autoscaler.Status.CurrentMetrics) > 0 && autoscaler.Status.CurrentMetrics[0].External != nil {
-		// Metrics are alive!
-
-		// CurrentValue is always 0 for some reason
-		// value := autoscaler.Status.CurrentMetrics[0].External.CurrentValue.AsDec()
-		avg := autoscaler.Status.CurrentMetrics[0].External.CurrentAverageValue
-
-		if replicas > 0 && desired == 1 && avg.IsZero() {
-			// 0 things in the queue, so scale to 0
-			// TODO: maybe have a cooldown period before scaling to 0 in case more work comes in (although the HPA already does that...)
-			//       have to store the last time we saw 0 things in the queue as an annotation; then compute time since then
-
-			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				// Retrieve the latest version of Deployment before attempting update
-				// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
-				deployment, err := clientSet.AppsV1().Deployments("default").Get(target, meta_v1.GetOptions{})
-				if err != nil {
-					return err
-				}
-
-				// lastScaledDownTimeStr, ok := deployment.Annotations["k8s.isazi.ai/last-scaled-down"]
-				lastScaledUpTimeStr, ok := deployment.Annotations["k8s.isazi.ai/last-scaled-up"]
-				if ok {
-					lastTime, err := time.Parse(time.RFC3339, lastScaledUpTimeStr)
-					if err == nil {
-						if since := (time.Now().UTC().Sub(lastTime)); since < scaleDownWaitPeriod {
-							logrus.Infof("Not descaling (last scaled up %s ago)", since.String())
-							return nil
-						}
-					}
-				}
-
-				logrus.WithField("name", autoscaler.Name).Infof("Scaling down!")
-				deployment.Annotations["k8s.isazi.ai/last-scaled-down"] = time.Now().UTC().Format(time.RFC3339)
-				var scale int32
-				scale = 0
-				deployment.Spec.Replicas = &scale
-				deployment, err = clientSet.AppsV1().Deployments("default").Update(deployment)
-				if err != nil {
-					return err
-				}
-
-				logrus.WithField("name", autoscaler.Name).Infof("Scaled to 0!")
-				return nil
-			})
-			if err != nil {
-				return err
-			}
+	var metricSpec *autoscaling_v2beta1.ExternalMetricSource
+	for _, ems := range autoscaler.Spec.Metrics {
+		if ems.Type == autoscaling_v2beta1.ExternalMetricSourceType {
+			metricSpec = ems.External
+			break
 		}
-	} else {
-		if replicas == 0 {
-			// TODO: scale up to 1 (or minReplicas actually)
-			// HACK: the HPA completely breaks when you set replicas=0. So we'll have to scale to 1 periodically so the HPA can refresh
-			//		 if there's still nothing in the queue, we will scale to 0 again after some time
-			//       else the HPA will take over and scale as usual
-			// TODO: store the last time we scaled to 0 as an annotation; then compute time since then
-			logrus.
-				WithFields(logrus.Fields{
-					"name": autoscaler.Name,
-					// "targetKind": targetKind,
-					"target":   target,
-					"replicas": replicas,
-					"desired":  desired,
-				}).
-				Info("Detected a Descaled HPA, maybe scaling up!")
+	}
+	if metricSpec == nil {
+		// TODO: return an identifiable error
+		//return errors.New("HPA does not use an External metric")
+		return nil
+	}
 
-			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				// Retrieve the latest version of Deployment before attempting update
-				// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
-				deployment, err := clientSet.AppsV1().Deployments("default").Get(target, meta_v1.GetOptions{})
-				if err != nil {
-					return err
-				}
+	logger := logrus.WithFields(logrus.Fields{
+		"name":    metricSpec.MetricName,
+		"queue":   metricSpec.MetricSelector.MatchLabels["metric.labels.queue"],
+		"cluster": metricSpec.MetricSelector.MatchLabels["resource.labels.cluster_name"],
+	})
+	logger.Infof("External metric found in spec")
 
-				lastTimeStr, ok := deployment.Annotations["k8s.isazi.ai/last-scaled-down"]
-				if ok {
-					lastTime, err := time.Parse(time.RFC3339, lastTimeStr)
-					if err == nil {
-						since := (time.Now().UTC().Sub(lastTime))
-						if since < scaleUpWaitPeriod {
-							logrus.Infof("Not scaling up (last scale down was %s ago)", since.String())
-							return nil
-						}
-					} else {
-						panic(err)
-					}
-				}
+	m, err := metrics.GetExternalMetric(clientSet, "default", metricSpec)
+	if err != nil {
+		panic(err)
+	}
 
-				deployment.Annotations["k8s.isazi.ai/last-scaled-up"] = time.Now().UTC().Format(time.RFC3339)
-				var scale int32
-				scale = 1
-				deployment.Spec.Replicas = &scale
-				deployment, err = clientSet.AppsV1().Deployments("default").Update(deployment)
-				if err != nil {
-					return err
-				}
+	var metricValue resource.Quantity
+	for _, mv := range m.Items {
+		if mv.MetricLabels["resource.labels.cluster_name"] != metricSpec.MetricSelector.MatchLabels["resource.labels.cluster_name"] {
+			logger.Warnf("Got metric for wrong cluster: %s", mv.MetricLabels["resource.labels.cluster_name"])
+			continue
+		}
 
-				logrus.WithField("name", autoscaler.Name).Infof("Scaled to 1!")
-				return nil
-			})
+		metricValue = mv.Value
+	}
+	logger.Infof("External metric value: %s", metricValue.String())
+
+	// Metrics are alive!
+
+	if replicas > 0 && metricValue.IsZero() {
+		// 0 things in the queue, so scale to 0
+		// TODO: maybe have a cooldown period before scaling to 0 in case more work comes in (although the HPA already does that...)
+		//       have to store the last time we saw 0 things in the queue as an annotation; then compute time since then
+		// TODO: this might become an annotation on a custom resource at some point
+
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Retrieve the latest version of Deployment before attempting update
+			// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+			deployment, err := clientSet.AppsV1().Deployments("default").Get(target, meta_v1.GetOptions{})
 			if err != nil {
 				return err
 			}
+
+			// lastScaledDownTimeStr, ok := deployment.Annotations["k8s.isazi.ai/last-scaled-down"]
+			lastScaledUpTimeStr, ok := deployment.Annotations["k8s.isazi.ai/last-scaled-up"]
+			if ok {
+				lastTime, err := time.Parse(time.RFC3339, lastScaledUpTimeStr)
+				if err == nil {
+					if since := (time.Now().UTC().Sub(lastTime)); since < scaleDownWaitPeriod {
+						logrus.Infof("Not descaling (last scaled up %s ago)", since.String())
+						return nil
+					}
+				}
+			}
+
+			logrus.WithField("name", autoscaler.Name).Infof("Scaling down!")
+			deployment.Annotations["k8s.isazi.ai/last-scaled-down"] = time.Now().UTC().Format(time.RFC3339)
+			var scale int32
+			scale = 0
+			deployment.Spec.Replicas = &scale
+			deployment, err = clientSet.AppsV1().Deployments("default").Update(deployment)
+			if err != nil {
+				return err
+			}
+
+			logrus.WithField("name", autoscaler.Name).Infof("Scaled to 0!")
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if replicas == 0 && !metricValue.IsZero() {
+		// TODO: scale up to 1 (or minReplicas actually)
+		logrus.
+			WithFields(logrus.Fields{
+				"name": autoscaler.Name,
+				// "targetKind": targetKind,
+				"target":   target,
+				"replicas": replicas,
+				"value":    metricValue.String(),
+			}).
+			Info("Detected a Descaled HPA, maybe scaling up!")
+
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Retrieve the latest version of Deployment before attempting update
+			// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+			deployment, err := clientSet.AppsV1().Deployments("default").Get(target, meta_v1.GetOptions{})
+			if err != nil {
+				return err
+			}
+
+			deployment.Annotations["k8s.isazi.ai/last-scaled-up"] = time.Now().UTC().Format(time.RFC3339)
+			var scale int32
+			scale = 1
+			deployment.Spec.Replicas = &scale
+			deployment, err = clientSet.AppsV1().Deployments("default").Update(deployment)
+			if err != nil {
+				return err
+			}
+
+			logrus.WithField("name", autoscaler.Name).Infof("Scaled to 1!")
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 
