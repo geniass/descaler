@@ -83,27 +83,6 @@ func Start(eventHandler handlers.Handler) {
 		kubeClient = utils.GetClient()
 	}
 
-	// // Deployment informer
-	// {
-	// 	informer := cache.NewSharedIndexInformer(
-	// 		&cache.ListWatch{
-	// 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
-	// 				return kubeClient.AppsV1().Deployments("default").List(options)
-	// 			},
-	// 			WatchFunc: func(options meta_v1.ListOptions) (watch.Interface, error) {
-	// 				return kubeClient.AppsV1().Deployments("default").Watch(options)
-	// 			},
-	// 		},
-	// 		&apps_v1.Deployment{},
-	// 		0, //Skip resync
-	// 		cache.Indexers{},
-	// 	)
-	// 	c := newResourceController(kubeClient, eventHandler, informer, "deployment")
-	// 	stopCh := make(chan struct{})
-	// 	defer close(stopCh)
-	// 	go c.Run(stopCh)
-	// }
-
 	// HPA informer
 	{
 		informer := cache.NewSharedIndexInformer(
@@ -273,9 +252,6 @@ func (c *Controller) processItem(newEvent Event) error {
 		*/
 		if newEvent.resourceType == "horizontalpodautoscaler" {
 			autoscaler := obj.(*autoscaling_v2beta1.HorizontalPodAutoscaler)
-			if autoscaler.Name != "master-worker" {
-				return nil
-			}
 			err := hpaUpdated(c.clientset, autoscaler)
 			if err != nil {
 				panic(err)
