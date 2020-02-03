@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: descaler-controller
+  labels:
+    app: descaler-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: descaler-controller
+  template:
+    metadata:
+      labels:
+        app: descaler-controller
+    spec:
+      serviceAccountName: descaler-controller
+      containers:
+      - name: descaler
+        image: eu.gcr.io/sophia-191915/descaler

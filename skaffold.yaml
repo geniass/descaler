@@ -1,0 +1,10 @@
+apiVersion: skaffold/v1beta13
+kind: Config
+build:
+  artifacts:
+  - image: eu.gcr.io/sophia-191915/descaler
+deploy:
+  kubectl:
+    manifests:
+    - k8s/deployment.yaml
+    - k8s/serviceaccount.yaml
