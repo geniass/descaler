@@ -48,11 +48,9 @@ import (
 const maxRetries = 5
 
 // these constants define the Descaler's behaviour
-// there's a trade-off between responsiveness (small scaleUpWaitPeriod) and cost-efficiency (high scaleUpWaitPeriod)
 // the Descaler will wait at least scaleDownWaitPeriod to scale down after scaling up
-// and it will wait at least scaleUpWaitPeriod to check the queue length (i.e. scale up to 1) after scaling down
-const scaleUpWaitPeriod = time.Minute * 2
-const scaleDownWaitPeriod = time.Second * 30
+const scaleDownWaitPeriod = time.Second * 60
+const hpaResyncInterval = time.Second * 10
 
 var serverStartTime time.Time
 
@@ -97,7 +95,7 @@ func Start(eventHandler handlers.Handler) {
 				},
 			},
 			&autoscaling_v2beta1.HorizontalPodAutoscaler{},
-			time.Second*20, //Skip resync
+			hpaResyncInterval,
 			cache.Indexers{},
 		)
 
@@ -235,16 +233,16 @@ func (c *Controller) processItem(newEvent Event) error {
 	// process events based on its type
 	switch newEvent.eventType {
 	case "create":
+		if newEvent.resourceType == "horizontalpodautoscaler" {
+			autoscaler := obj.(*autoscaling_v2beta1.HorizontalPodAutoscaler)
+			err := hpaUpdated(c.clientset, autoscaler)
+			if err != nil {
+				panic(err)
+			}
+		}
 		// compare CreationTimestamp and serverStartTime and alert only on latest events
 		// Could be Replaced by using Delta or DeltaFIFO
 		if objectMeta.CreationTimestamp.Sub(serverStartTime).Seconds() > 0 {
-			if newEvent.resourceType == "horizontalpodautoscaler" {
-				autoscaler := obj.(*autoscaling_v2beta1.HorizontalPodAutoscaler)
-				err := hpaUpdated(c.clientset, autoscaler)
-				if err != nil {
-					panic(err)
-				}
-			}
 			c.eventHandler.ObjectCreated(obj)
 			return nil
 		}
@@ -301,7 +299,7 @@ func hpaUpdated(clientSet *kubernetes.Clientset, autoscaler *autoscaling_v2beta1
 		"queue":   metricSpec.MetricSelector.MatchLabels["metric.labels.queue"],
 		"cluster": metricSpec.MetricSelector.MatchLabels["resource.labels.cluster_name"],
 	})
-	logger.Infof("External metric found in spec")
+	logger.Debugf("External metric found in spec")
 
 	m, err := metrics.GetExternalMetric(clientSet, "default", metricSpec)
 	if err != nil {
@@ -374,7 +372,7 @@ func hpaUpdated(clientSet *kubernetes.Clientset, autoscaler *autoscaling_v2beta1
 				"replicas": replicas,
 				"value":    metricValue.String(),
 			}).
-			Info("Detected a Descaled HPA, maybe scaling up!")
+			Info("Detected a Descaled HPA, scaling up!")
 
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			// Retrieve the latest version of Deployment before attempting update
